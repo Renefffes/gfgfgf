@@ -12,15 +12,41 @@ app.use(express.json());
 
 // ─── In-memory store ───────────────────────────────────────────────────────────
 
-/** @type {Map<string, { discordId: string, username: string, plan: string, timeAmount: number, createdAt: string, expiresAt: string | null }>} */
+/**
+ * Map<discordId, { discordId, username, plan, timeAmount, createdAt, expiresAt }>
+ * Each user has one active plan. Multiple users can be on the API at the same time.
+ * Users are automatically removed when their time runs out.
+ */
 const users = new Map();
 
-// ─── Helper ────────────────────────────────────────────────────────────────────
+// ─── Helpers ───────────────────────────────────────────────────────────────────
 
 function calcExpiry(timeAmountMinutes) {
   if (!timeAmountMinutes || timeAmountMinutes <= 0) return null;
   return new Date(Date.now() + timeAmountMinutes * 60 * 1000).toISOString();
 }
+
+function isActive(expiresAt) {
+  return expiresAt === null || new Date(expiresAt) > new Date();
+}
+
+/** Runs every 60s — removes any user whose plan time has expired. */
+function purgeExpired() {
+  let removed = 0;
+  for (const [discordId, user] of users.entries()) {
+    if (!isActive(user.expiresAt)) {
+      users.delete(discordId);
+      removed++;
+    }
+  }
+  if (removed > 0) {
+    console.log(`🧹 Purged ${removed} expired user(s)`);
+  }
+}
+
+// ─── Auto-expiry: runs every 60 seconds ───────────────────────────────────────
+
+setInterval(purgeExpired, 60 * 1000);
 
 // ─── Routes ────────────────────────────────────────────────────────────────────
 
@@ -35,7 +61,8 @@ app.get("/", (req, res) => {
 
 /**
  * POST /users
- * Called by Google AI Studio to register / update a user.
+ * Called by Google AI Studio to add a user with a plan and time.
+ * If the user already exists their plan is overwritten with the new one.
  *
  * Body (JSON):
  * {
@@ -72,15 +99,22 @@ app.post("/users", (req, res) => {
 
   users.set(discordId, record);
 
-  return res.status(201).json({ message: "User saved successfully.", user: record });
+  return res.status(201).json({ message: "User added successfully.", user: record });
 });
 
 /**
  * GET /users
- * Returns all users. Optional filter: ?plan=premium
+ * Returns all currently active users.
+ * Optional filter: ?plan=premium
  */
 app.get("/users", (req, res) => {
-  let list = Array.from(users.values());
+  let list = Array.from(users.values()).map((u) => ({
+    ...u,
+    active: isActive(u.expiresAt),
+    minutesLeft: u.expiresAt
+      ? Math.max(0, Math.floor((new Date(u.expiresAt) - Date.now()) / 60000))
+      : null,
+  }));
 
   if (req.query.plan) {
     list = list.filter(
@@ -99,24 +133,30 @@ app.get("/users/:discordId", (req, res) => {
   const user = users.get(req.params.discordId);
   if (!user) return res.status(404).json({ error: "User not found." });
 
-  const active = user.expiresAt === null || new Date(user.expiresAt) > new Date();
-  res.json({ ...user, active });
+  res.json({
+    ...user,
+    active: isActive(user.expiresAt),
+    minutesLeft: user.expiresAt
+      ? Math.max(0, Math.floor((new Date(user.expiresAt) - Date.now()) / 60000))
+      : null,
+  });
 });
 
 /**
  * DELETE /users/:discordId
- * Remove a user.
+ * Manually remove a user before their time is up.
  */
 app.delete("/users/:discordId", (req, res) => {
   if (!users.has(req.params.discordId)) {
     return res.status(404).json({ error: "User not found." });
   }
   users.delete(req.params.discordId);
-  res.json({ message: "User deleted." });
+  res.json({ message: "User removed." });
 });
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`✅  API running on port ${PORT}`);
+  console.log(`🕐  Expired users will be purged automatically every 60 seconds`);
 });
